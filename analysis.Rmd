@@ -1,0 +1,252 @@
+---
+title: "Classifying Red Wine vs. White Wine"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+# Load packages and data
+```{r}
+library(tidyverse, quietly = T)
+library(GGally, quietly = T)
+require(caret, quietly = T)
+require(bestglm)
+require(rpart)
+require(randomForest)
+
+wines0 <- readRDS("./data/wineQualityCombined.RDS")
+wines <- wines0 %>% 
+  select(-quality)
+```
+
+# Data overview
+
+```{r, fig.height=15, fig.width=15, include =FALSE}
+my_diag <- function(data, mapping, ...) {
+  ggplot(data = data, mapping=mapping) +
+    geom_density(..., alpha = 0.7, color = NA) 
+}
+
+my_lower <- function(data, mapping, ...) {
+  ggplot(data = data, mapping=mapping) +
+    geom_point(..., alpha = 0.3) 
+}
+
+wines %>% 
+  ggpairs(mapping = aes(fill = class, color = class, alpha = 0.3), diag = list(continuous = my_diag), lower = list(continuous = my_lower))
+```
+
+![](plots/ggpairs_annotated.png)
+
+There is only correlation bewteen:  
+
+* density and alcohol  
+* density and residual.sugar  
+* total.sulfur.dioxid and free.sulfur.dioxid  
+
+Further the overview plot shows us that there are some variables which seem to be
+appropriate to distinguish between red and white wine.
+
+
+# Feature Engineering
+
+# Dry, Medium dry, Medium, Sweet (only depending on sugar level)
+
+```{r}
+wines <- wines %>% 
+  mutate(product.type = factor(ifelse(residual.sugar < 4, 
+                               "dry",
+                               ifelse(residual.sugar < 12, 
+                                      "medium dry",
+                                      ifelse(residual.sugar < 45,
+                                             "medium",
+                                             "sweet")))))
+wines %>% 
+  ggplot() +
+  geom_histogram(aes(x = residual.sugar, fill = class), binwidth = 0.5) 
+
+wines %>% 
+  ggplot() +
+  geom_bar(aes(x = product.type, fill = class), position = position_fill()) +
+  ggtitle("Share of wine class within product type")
+
+wines %>% 
+  ggplot() +
+  geom_bar(aes(x = class, fill = product.type), position = position_fill()) +
+  ggtitle("Share of product.type within wine class")
+```
+
+# Modeling
+
+## Logistic Regression
+
+As a first try we will fit some logistic regression models. To choose the best predictors, we will
+
+### Full Model with cross validation
+```{r}
+# train data without class information
+trainData <- wines %>% 
+  dplyr::select(-class)
+# class information for trainData
+trainClasses <- wines$class
+
+set.seed(1)
+lm.full <- caret::train(x = trainData, y = trainClasses,
+             method = "glm",
+             family = "binomial",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(lm.full, norm = "average")
+```
+
+### Best Subset Selection with max 7 predictors
+
+Next we will try to select the best model by performing a best subset selection.
+```{r}
+# lm.best <- bestglm(cbind(trainData, y = trainClasses), family = binomial, nvmax = 7)
+
+# saveRDS(lm.best, "lm.best")
+lm.best <- readRDS("lm.best")
+lm.best$BestModels
+
+
+
+# fit best model using cross validation
+trainData <- wines %>% 
+  dplyr::select(volatile.acidity, chlorides, residual.sugar,
+                total.sulfur.dioxide, density, alcohol, product.type)
+set.seed(1)
+lm.best.fit <- caret::train(x = trainData, y = trainClasses, 
+             method = "glm",
+             family = "binomial",
+             trControl = trainControl(method = "cv"))
+
+confusionMatrix.train(lm.best.fit, norm = "average")
+```
+Using the same seed our best subset model (max. 7 predictors) is slightly better than our full
+model. 
+
+### Stepwise Forward Selection
+Now we want to see weather stepwise forward selection would be a good approach to our best subset model.
+```{r}
+trainData <- data.frame(rep(1, length(trainClasses)))
+set.seed(1)
+null <- glm(formula = class ~ 1, family = "binomial", data = wines)
+
+step(null, scope = list(lower = null,
+                                   upper = lm.full$finalModel),
+     direction = "forward")
+
+
+trainData <- wines %>% 
+  dplyr::select(total.sulfur.dioxide, density , residual.sugar ,
+    alcohol, volatile.acidity, product.type, chlorides , free.sulfur.dioxide ,
+    fixed.acidity, pH, citric.acid)
+
+set.seed(1)
+lm.forward <- caret::train(x = trainData, y = trainClasses, 
+             method = "glm",
+             family = "binomial",
+             trControl = trainControl(method = "cv"))
+
+confusionMatrix.train(lm.forward, norm = "average")
+```
+## Linear Discriminant Analyis
+
+### Full Model
+```{r}
+
+set.seed(1)
+lda.full <- caret::train(class ~., data = wines,
+             method = "lda",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(lda.full, norm = "average")
+```
+
+### LDA with best subset from logistic regression
+
+```{r}
+set.seed(1)
+lda.best <- caret::train(class ~ volatile.acidity + chlorides +residual.sugar +
+                total.sulfur.dioxide + density + alcohol + product.type,
+                data = wines,
+             method = "lda",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(lda.best, norm = "average")
+```
+
+## Quadratic Discriminant Analysis
+
+### Full Model without product type
+
+We will leave out prodcut type since there are no "sweet" wines in class r. So the QDA
+can't estimate all parameters
+
+```{r}
+set.seed(1)
+qda.full <- caret::train(class ~. -product.type, data = wines,
+             method = "qda",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(qda.full, norm = "average")
+```
+
+
+## Decision tree
+
+```{r}
+trainData <- wines %>% 
+  dplyr::select(-class)
+
+set.seed(1)
+tree <- caret::train(x = trainData, y = trainClasses,
+             method = "rpart",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(tree, norm = "average")
+```
+
+## Random Forest
+
+```{r}
+trainData <- wines %>% 
+  dplyr::select(-class)
+
+set.seed(1)
+rf <- caret::train(x = trainData, y = trainClasses,
+             method = "rf",
+             trControl = trainControl(method = "cv"))
+
+# average confusionMatrix of lm.full
+confusionMatrix.train(rf, norm = "average")
+```
+
+
+## Compairing Cross Validation Accuracy of all Models
+
+```{r}
+accuracyTable <- data.frame()
+
+accuracies <- list(lm.best = lm.best.fit$resample, lm.full = lm.full$resample,
+                   forward = lm.forward$resample, tree = tree$resample,
+                   lda.full = lda.full$resample, lda.best = lda.best$resample,
+                   rf = rf$resample)
+
+for (i in 1:length(accuracies)) {
+  accuracyTable <- 
+    rbind(accuracyTable, cbind(accuracies[[i]], model = rep(names(accuracies[i]), dim(accuracies[[i]])[1])))
+}
+
+accuracyTable %>% 
+  filter(model != "tree") %>% 
+  ggplot() +
+  geom_boxplot(aes(x = model, y = Accuracy)) +
+  geom_point(aes(x = model, y = Accuracy), position = position_jitter(width = 0.1))
+```
+
